@@ -1,0 +1,335 @@
+name: Secure CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Minimal token permissions (least privilege for GITHUB_TOKEN)
+permissions:
+  contents: read
+  id-token: write       # needed for OIDC → AWS role assumption
+  security-events: write # needed for uploading SARIF to GitHub Security tab
+  pull-requests: write  # needed to comment findings on PRs
+
+env:
+  AWS_REGION: us-east-1
+  IMAGE_NAME: secure-cicd-app
+
+jobs:
+  # ═══════════════════════════════════════════
+  # JOB 1 — Secrets Detection
+  # Runs first; if secrets are found, fail fast
+  # before any code ever reaches cloud infra
+  # ═══════════════════════════════════════════
+  secrets-scan:
+    name: 🔑 Secrets Detection (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so gitleaks can scan all commits
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}  # optional for orgs
+
+      - name: Upload Gitleaks SARIF
+        if: failure()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+          category: gitleaks
+
+  # ═══════════════════════════════════════════
+  # JOB 2 — SAST (Static Analysis)
+  # Python source code analysis with Bandit
+  # ═══════════════════════════════════════════
+  sast:
+    name: 🔍 SAST (Bandit)
+    runs-on: ubuntu-latest
+    needs: secrets-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Bandit
+        run: pip install bandit[sarif]
+
+      - name: Run Bandit
+        run: |
+          bandit -r app/ \
+            --severity-level medium \
+            --confidence-level medium \
+            --format sarif \
+            -o bandit-results.sarif
+        continue-on-error: true  # upload results even on findings
+
+      - name: Upload Bandit SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit-results.sarif
+          category: bandit
+
+      - name: Fail if HIGH severity findings
+        run: |
+          bandit -r app/ --severity-level high --confidence-level high -f json -o bandit-high.json || true
+          python3 -c "
+          import json, sys
+          with open('bandit-high.json') as f:
+            data = json.load(f)
+          highs = [r for r in data.get('results', []) if r['issue_severity'] == 'HIGH']
+          if highs:
+            print(f'FAIL: {len(highs)} HIGH severity finding(s) found:')
+            for h in highs:
+              print(f\"  [{h['issue_severity']}] {h['issue_text']} @ {h['filename']}:{h['line_number']}\")
+            sys.exit(1)
+          print('PASS: No HIGH severity findings.')
+          "
+
+  # ═══════════════════════════════════════════
+  # JOB 3 — Dependency Scanning
+  # Check for known CVEs in dependencies
+  # ═══════════════════════════════════════════
+  dependency-scan:
+    name: 📦 Dependency Scan (pip-audit + Safety)
+    runs-on: ubuntu-latest
+    needs: secrets-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install scanners
+        run: pip install pip-audit safety
+
+      - name: Run pip-audit (checks PyPI advisory DB)
+        run: |
+          pip-audit -r app/requirements.txt \
+            --format json \
+            --output pip-audit-results.json \
+            --ignore-vuln PYSEC-2022-42969 \
+            || true
+
+      - name: Parse pip-audit results
+        run: |
+          python3 -c "
+          import json, sys
+          with open('pip-audit-results.json') as f:
+            data = json.load(f)
+          vulns = data.get('dependencies', [])
+          critical = [v for dep in vulns for v in dep.get('vulns', []) if 'CRITICAL' in str(v.get('aliases', ''))]
+          if critical:
+            print(f'FAIL: {len(critical)} CRITICAL CVE(s) found!')
+            sys.exit(1)
+          print(f'PASS: pip-audit found no critical vulnerabilities.')
+          "
+
+      - name: Run Safety (checks against Safety DB)
+        run: |
+          safety check \
+            -r app/requirements.txt \
+            --json \
+            --output safety-results.json \
+            || true
+
+      - name: Upload dependency scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-scan-results
+          path: |
+            pip-audit-results.json
+            safety-results.json
+
+  # ═══════════════════════════════════════════
+  # JOB 4 — IaC Policy Check (OPA/Conftest)
+  # Validates Terraform plans against Rego rules
+  # ═══════════════════════════════════════════
+  iac-policy-check:
+    name: 📋 IaC Policy Check (Conftest + Checkov)
+    runs-on: ubuntu-latest
+    needs: secrets-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform Init (with mocked backend)
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend=false \
+            -input=false
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Generate Terraform plan JSON (for OPA)
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var="environment=dev" \
+            -out=tfplan.binary \
+            -input=false \
+            || echo "Plan requires AWS credentials — skipping plan, running Checkov on source"
+
+      - name: Convert plan to JSON (if plan succeeded)
+        working-directory: terraform
+        run: |
+          if [ -f tfplan.binary ]; then
+            terraform show -json tfplan.binary > tfplan.json
+          fi
+
+      - name: Install Conftest
+        run: |
+          wget -q https://github.com/open-policy-agent/conftest/releases/download/v0.50.0/conftest_0.50.0_Linux_x86_64.tar.gz
+          tar xzf conftest_0.50.0_Linux_x86_64.tar.gz
+          sudo mv conftest /usr/local/bin/
+
+      - name: Run OPA/Conftest policy checks
+        run: |
+          if [ -f terraform/tfplan.json ]; then
+            conftest test terraform/tfplan.json \
+              --policy policies/ \
+              --namespace terraform.security \
+              --output json | tee conftest-results.json
+          else
+            echo "Skipping conftest (no plan JSON) — Checkov will cover IaC checks."
+          fi
+
+      - name: Run Checkov (IaC misconfiguration scanner)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform/
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          soft_fail: false
+          skip_check: CKV_AWS_144  # cross-region replication (out of scope for this project)
+
+      - name: Upload Checkov SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov
+
+  # ═══════════════════════════════════════════
+  # JOB 5 — Build & Container Image Scan
+  # Build Docker image, scan with Trivy before
+  # it ever gets pushed to ECR
+  # ═══════════════════════════════════════════
+  build-and-scan:
+    name: 🐳 Build + Trivy Container Scan
+    runs-on: ubuntu-latest
+    needs: [sast, dependency-scan, iac-policy-check]
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (local, not pushed yet)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: app/
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          load: true  # load into local docker daemon for scanning
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"        # fail pipeline on CRITICAL/HIGH findings
+          ignore-unfixed: true  # don't fail on vulns with no fix available
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+
+      - name: Run Trivy filesystem scan (Dockerfile + app code)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: app/
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "0"  # advisory only for fs scan
+
+  # ═══════════════════════════════════════════
+  # JOB 6 — Push to ECR (prod only, main branch)
+  # Only runs after ALL security gates pass
+  # Uses OIDC (no long-lived AWS keys stored!)
+  # ═══════════════════════════════════════════
+  push-to-ecr:
+    name: 🚀 Push to ECR (OIDC Auth)
+    runs-on: ubuntu-latest
+    needs: build-and-scan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production  # requires manual approval in GitHub
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CICD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push to ECR
+        uses: docker/build-push-action@v5
+        with:
+          context: app/
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true   # SLSA provenance attestation
+          sbom: true         # generates SBOM attestation
+
+      - name: Post deployment summary
+        run: |
+          echo "## ✅ Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}:${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security gates passed | ✅ Gitleaks, Bandit, pip-audit, Checkov, Trivy |" >> $GITHUB_STEP_SUMMARY

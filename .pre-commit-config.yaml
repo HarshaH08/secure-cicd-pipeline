@@ -1,0 +1,56 @@
+# Pre-commit hooks — run security checks LOCALLY before pushing
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+repos:
+  # ─────────────────────────────────────────
+  # Secrets Detection — catch secrets before they reach git history
+  # ─────────────────────────────────────────
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.1
+    hooks:
+      - id: gitleaks
+        name: "🔑 Gitleaks: detect secrets"
+
+  # ─────────────────────────────────────────
+  # General hygiene
+  # ─────────────────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: detect-private-key       # catch raw private keys
+        name: "🔑 Detect private keys"
+      - id: no-commit-to-branch
+        args: ["--branch", "main"]   # prevent direct pushes to main
+        name: "🛡️  No direct commits to main"
+
+  # ─────────────────────────────────────────
+  # Python SAST — Bandit
+  # ─────────────────────────────────────────
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.7
+    hooks:
+      - id: bandit
+        name: "🔍 Bandit: Python SAST"
+        args: ["-c", "pyproject.toml", "--severity-level", "medium"]
+        additional_dependencies: ["bandit[toml]"]
+
+  # ─────────────────────────────────────────
+  # Terraform — format + validate + Checkov
+  # ─────────────────────────────────────────
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.88.0
+    hooks:
+      - id: terraform_fmt
+        name: "📐 Terraform: format"
+      - id: terraform_validate
+        name: "✅ Terraform: validate"
+      - id: checkov
+        name: "📋 Checkov: IaC policy check"
+        args:
+          - --args=--quiet
+          - --args=--framework=terraform

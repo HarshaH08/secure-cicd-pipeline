@@ -1,0 +1,5 @@
+[tool.bandit]
+targets = ["app"]
+skips = ["B104"]   # B104 = binding to 0.0.0.0 (acceptable in containers)
+severity = "medium"
+confidence = "medium"
