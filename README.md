@@ -131,13 +131,3 @@ cd terraform && terraform plan -out=tfplan.binary && terraform show -json tfplan
 # Run policy checks
 conftest test tfplan.json --policy ../policies/ --namespace terraform.security
 ```
-
-## Resume Bullets (Notable / DevSecOps roles)
-
-> **Built a shift-left secure CI/CD pipeline** using GitHub Actions and Terraform, integrating Gitleaks (secrets detection), Bandit (SAST), pip-audit (SCA), OPA/Conftest (IaC policy-as-code), and Trivy (container scanning) as automated security gates — blocking vulnerable code before it reaches cloud infrastructure.
-
-> **Implemented least-privilege cloud security posture** on AWS using Terraform: provisioned OIDC-based IAM role assumption for GitHub Actions (eliminating long-lived credentials), customer-managed KMS encryption for ECR and S3, immutable container image tags, and CloudTrail audit logging with integrity validation.
-
-> **Authored custom OPA/Rego policies** enforcing 8 security controls on Terraform plan JSON (S3 public access, encryption-at-rest, IAM wildcard deny, KMS key rotation) integrated into CI via Conftest — catching misconfigurations before cloud deployment.
-
-> **Deployed secure-by-default developer workflows** including pre-commit hooks (Gitleaks, Bandit, Checkov, terraform fmt) and GitHub Actions SARIF upload to GitHub Security tab, enabling continuous misconfiguration tracking across 5 tool categories.
