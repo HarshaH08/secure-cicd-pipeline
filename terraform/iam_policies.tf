@@ -116,7 +116,52 @@ data "aws_iam_policy_document" "cicd_permissions" {
 # ─────────────────────────────────────────────
 # KMS key policies — prevent key misuse
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# CloudTrail → CloudWatch Logs delivery role
+# ─────────────────────────────────────────────
+data "aws_iam_policy_document" "cloudtrail_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["cloudtrail.amazonaws.com"]
+    }
+  }
+}
+
+data "aws_iam_policy_document" "cloudtrail_cloudwatch" {
+  # Scoped to this log group's streams only — no wildcard resource.
+  statement {
+    sid    = "WriteCloudTrailEvents"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]
+    resources = ["${aws_cloudwatch_log_group.cloudtrail.arn}:*"]
+  }
+}
+
 data "aws_iam_policy_document" "kms_ecr" {
+  # ACCEPTED RISK — CONFIRMED FALSE POSITIVE (CKV_AWS_111, CKV_AWS_356, CKV_AWS_109)
+  #
+  # These checks apply identity-policy heuristics to a resource-based policy.
+  # In a KMS *key policy*, Resource: "*" means "the key this policy is attached
+  # to" — not "every key in the account." The wildcard is scoped by attachment,
+  # so there is no over-permission to remove.
+  #
+  # The RootAccess statement granting kms:* to the account root is AWS's own
+  # recommended default key policy. Removing it risks permanently orphaning the
+  # key: with no principal able to modify the policy, the key and everything
+  # encrypted under it become unrecoverable.
+  # Ref: https://docs.aws.amazon.com/kms/latest/developerguide/key-policy-default.html
+  #
+  # Every non-root statement below is already restricted to a named principal
+  # and the three minimum actions required for envelope encryption.
+  #checkov:skip=CKV_AWS_111:KMS key policy — Resource "*" is scoped to the attached key, not all keys
+  #checkov:skip=CKV_AWS_356:KMS key policy — resource-based, wildcard is inherent to the policy type
+  #checkov:skip=CKV_AWS_109:Root access is the AWS-recommended default; removing it risks orphaning the key
   statement {
     sid     = "RootAccess"
     effect  = "Allow"
@@ -161,6 +206,12 @@ data "aws_iam_policy_document" "kms_ecr" {
 }
 
 data "aws_iam_policy_document" "kms_s3" {
+  # Same confirmed false positive as kms_ecr above — see that block for the
+  # full reasoning on why Resource "*" in a KMS key policy is scoped to the
+  # attached key rather than the whole account.
+  #checkov:skip=CKV_AWS_111:KMS key policy — Resource "*" is scoped to the attached key, not all keys
+  #checkov:skip=CKV_AWS_356:KMS key policy — resource-based, wildcard is inherent to the policy type
+  #checkov:skip=CKV_AWS_109:Root access is the AWS-recommended default; removing it risks orphaning the key
   statement {
     sid     = "RootAccess"
     effect  = "Allow"
@@ -183,6 +234,50 @@ data "aws_iam_policy_document" "kms_s3" {
     principals {
       type        = "AWS"
       identifiers = [aws_iam_role.cicd.arn]
+    }
+    resources = ["*"]
+  }
+
+  # CloudWatch Logs encrypts the CloudTrail log group with this key. The
+  # ArnLike condition scopes access to log groups in this account/region only,
+  # rather than granting the service blanket use of the key. Written as a
+  # literal ARN pattern rather than a resource reference to avoid a dependency
+  # cycle: the log group needs the key, so the key policy cannot need the group.
+  statement {
+    sid    = "CloudWatchLogsAccess"
+    effect = "Allow"
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:DescribeKey",
+    ]
+    principals {
+      type        = "Service"
+      identifiers = ["logs.${data.aws_region.current.name}.amazonaws.com"]
+    }
+    resources = ["*"]
+    condition {
+      test     = "ArnLike"
+      variable = "kms:EncryptionContext:aws:logs:arn"
+      values   = ["arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:*"]
+    }
+  }
+
+  # CloudTrail writes encrypted objects to the log bucket and publishes to the
+  # SNS topic, both of which use this key.
+  statement {
+    sid    = "CloudTrailAndSNSAccess"
+    effect = "Allow"
+    actions = [
+      "kms:GenerateDataKey*",
+      "kms:Decrypt",
+      "kms:DescribeKey",
+    ]
+    principals {
+      type        = "Service"
+      identifiers = ["cloudtrail.amazonaws.com", "sns.amazonaws.com"]
     }
     resources = ["*"]
   }
@@ -221,4 +316,46 @@ data "aws_iam_policy_document" "cloudtrail_logs" {
 resource "aws_s3_bucket_policy" "cloudtrail_logs" {
   bucket = aws_s3_bucket.access_logs.id
   policy = data.aws_iam_policy_document.cloudtrail_logs.json
+}
+
+# ─────────────────────────────────────────────
+# SNS topic policy — allow CloudTrail to publish
+# ─────────────────────────────────────────────
+data "aws_iam_policy_document" "sns_security_alerts" {
+  statement {
+    sid     = "AllowCloudTrailPublish"
+    effect  = "Allow"
+    actions = ["SNS:Publish"]
+    principals {
+      type        = "Service"
+      identifiers = ["cloudtrail.amazonaws.com"]
+    }
+    resources = [aws_sns_topic.security_alerts.arn]
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
+
+  statement {
+    sid     = "AllowCloudWatchAlarmsPublish"
+    effect  = "Allow"
+    actions = ["SNS:Publish"]
+    principals {
+      type        = "Service"
+      identifiers = ["cloudwatch.amazonaws.com"]
+    }
+    resources = [aws_sns_topic.security_alerts.arn]
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
+}
+
+resource "aws_sns_topic_policy" "security_alerts" {
+  arn    = aws_sns_topic.security_alerts.arn
+  policy = data.aws_iam_policy_document.sns_security_alerts.json
 }
