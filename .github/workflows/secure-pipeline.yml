@@ -41,6 +41,7 @@ jobs:
 
       - name: Upload Gitleaks SARIF
         if: failure()
+        continue-on-error: true  # reporting to Security tab must never gate the pipeline
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results.sarif
@@ -68,6 +69,7 @@ jobs:
       - name: Run Bandit
         run: |
           bandit -r app/ \
+            -c pyproject.toml \
             --severity-level medium \
             --confidence-level medium \
             --format sarif \
@@ -75,6 +77,7 @@ jobs:
         continue-on-error: true  # upload results even on findings
 
       - name: Upload Bandit SARIF to GitHub Security tab
+        continue-on-error: true  # reporting to Security tab must never gate the pipeline
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: bandit-results.sarif
@@ -82,7 +85,7 @@ jobs:
 
       - name: Fail if HIGH severity findings
         run: |
-          bandit -r app/ --severity-level high --confidence-level high -f json -o bandit-high.json || true
+          bandit -r app/ -c pyproject.toml --severity-level high --confidence-level high -f json -o bandit-high.json || true
           python3 -c "
           import json, sys
           with open('bandit-high.json') as f:
@@ -223,6 +226,8 @@ jobs:
           skip_check: CKV_AWS_144  # cross-region replication (out of scope for this project)
 
       - name: Upload Checkov SARIF
+        if: always()  # upload findings to Security tab even when checkov fails the gate
+        continue-on-error: true  # reporting to Security tab must never gate the pipeline
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: checkov-results.sarif
@@ -268,6 +273,7 @@ jobs:
 
       - name: Upload Trivy SARIF
         if: always()
+        continue-on-error: true  # reporting to Security tab must never gate the pipeline
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-results.sarif

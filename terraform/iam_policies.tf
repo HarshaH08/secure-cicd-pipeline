@@ -114,8 +114,52 @@ data "aws_iam_policy_document" "cicd_permissions" {
 }
 
 # ─────────────────────────────────────────────
-# KMS key policy — prevent key misuse
+# KMS key policies — prevent key misuse
 # ─────────────────────────────────────────────
+data "aws_iam_policy_document" "kms_ecr" {
+  statement {
+    sid     = "RootAccess"
+    effect  = "Allow"
+    actions = ["kms:*"]
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "CIServiceAccess"
+    effect = "Allow"
+    actions = [
+      "kms:GenerateDataKey",
+      "kms:Decrypt",
+      "kms:DescribeKey",
+    ]
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_role.cicd.arn]
+    }
+    resources = ["*"]
+  }
+
+  # ECR needs to call KMS on push/pull for image layer encryption
+  statement {
+    sid    = "ECRServiceAccess"
+    effect = "Allow"
+    actions = [
+      "kms:GenerateDataKey",
+      "kms:Decrypt",
+      "kms:DescribeKey",
+    ]
+    principals {
+      type        = "Service"
+      identifiers = ["ecr.amazonaws.com"]
+    }
+    resources = ["*"]
+  }
+}
+
 data "aws_iam_policy_document" "kms_s3" {
   statement {
     sid     = "RootAccess"

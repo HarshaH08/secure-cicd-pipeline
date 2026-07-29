@@ -8,15 +8,12 @@ terraform {
     }
   }
 
-  # Remote state with encryption and locking
-  backend "s3" {
-    bucket         = "notable-tfstate-${var.environment}"
-    key            = "secure-pipeline/terraform.tfstate"
-    region         = var.aws_region
-    encrypt        = true
-    dynamodb_table = "tf-state-lock"
-    kms_key_id     = "alias/terraform-state"
-  }
+  # Remote state with encryption and locking.
+  # NOTE: backend blocks CANNOT contain variables or interpolation — Terraform
+  # reads this before variables are evaluated. Values are supplied at init time
+  # via partial configuration:
+  #   terraform init -backend-config=backend-dev.hcl
+  backend "s3" {}
 }
 
 provider "aws" {
@@ -69,6 +66,10 @@ resource "aws_ecr_lifecycle_policy" "app" {
 # ─────────────────────────────────────────────
 # S3 — artifact storage (secure by default)
 # ─────────────────────────────────────────────
+# ACCEPTED RISK (CKV2_AWS_62): no event notification configured. This bucket
+# holds CI build artifacts, not a data pipeline needing near-real-time
+# triggers on new objects — there's no downstream consumer to notify.
+#checkov:skip=CKV2_AWS_62:CI artifact bucket has no event-driven consumer
 resource "aws_s3_bucket" "artifacts" {
   bucket        = "${var.project_name}-artifacts-${var.environment}-${data.aws_caller_identity.current.account_id}"
   force_destroy = false
@@ -104,7 +105,7 @@ resource "aws_s3_bucket_logging" "artifacts" {
   target_prefix = "artifacts/"
 }
 
-# Separate access log bucket
+#checkov:skip=CKV2_AWS_62:Log bucket has no event-driven consumer in this environment
 resource "aws_s3_bucket" "access_logs" {
   bucket        = "${var.project_name}-access-logs-${var.environment}-${data.aws_caller_identity.current.account_id}"
   force_destroy = false
@@ -116,6 +117,43 @@ resource "aws_s3_bucket_public_access_block" "access_logs" {
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
+}
+
+# FIX: this was missing — Checkov (CKV_AWS_145) correctly caught that the
+# access_logs bucket had no encryption config, unlike the artifacts bucket.
+resource "aws_s3_bucket_server_side_encryption_configuration" "access_logs" {
+  bucket = aws_s3_bucket.access_logs.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.s3.arn
+    }
+    bucket_key_enabled = true
+  }
+}
+
+# FIX: lifecycle rules (CKV2_AWS_61) — expire old noncurrent versions so
+# storage costs don't grow forever and stale data doesn't linger.
+resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+  rule {
+    id     = "expire-noncurrent-versions"
+    status = "Enabled"
+    noncurrent_version_expiration {
+      noncurrent_days = 90
+    }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "access_logs" {
+  bucket = aws_s3_bucket.access_logs.id
+  rule {
+    id     = "expire-old-logs"
+    status = "Enabled"
+    expiration {
+      days = 365 # audit logs kept 1 year, then expired
+    }
+  }
 }
 
 # ─────────────────────────────────────────────
@@ -137,6 +175,10 @@ resource "aws_kms_key" "ecr" {
   description             = "KMS key for ECR image encryption"
   deletion_window_in_days = 30
   enable_key_rotation     = true
+  # FIX: Checkov (CKV2_AWS_64) caught that this key had no explicit policy,
+  # unlike the S3 key below. Without one, AWS applies a permissive default
+  # key policy — better to state access explicitly.
+  policy = data.aws_iam_policy_document.kms_ecr.json
 }
 
 resource "aws_kms_alias" "ecr" {
@@ -155,6 +197,17 @@ resource "aws_iam_role" "cicd" {
   tags = { Purpose = "github-actions-cicd" }
 }
 
+# ACCEPTED RISK (CKV_AWS_356, CKV_AWS_109, CKV_AWS_111):
+# Checkov flags the wildcard Resource on the ECRAuth statement inside this
+# policy. That statement grants ONLY ecr:GetAuthorizationToken, which per
+# AWS's own IAM reference does not support resource-level permissions and
+# must use "*": https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonelasticcontainerregistry.html
+# Every other statement in cicd_permissions.json is scoped to a specific
+# resource ARN. Confirmed false positive — documenting instead of suppressing
+# silently, per the JD's "triage and track findings to closure."
+#checkov:skip=CKV_AWS_356:GetAuthorizationToken requires Resource="*" — no resource-level permissions exist for this action
+#checkov:skip=CKV_AWS_109:Same statement as above; token generation only, no permissions-management action granted
+#checkov:skip=CKV_AWS_111:Same statement as above; not a write action, all real write actions below are scoped to specific ARNs
 resource "aws_iam_policy" "cicd" {
   name   = "${var.project_name}-cicd-policy-${var.environment}"
   policy = data.aws_iam_policy_document.cicd_permissions.json
@@ -168,6 +221,12 @@ resource "aws_iam_role_policy_attachment" "cicd" {
 # ─────────────────────────────────────────────
 # CloudTrail — audit logging
 # ─────────────────────────────────────────────
+# ACCEPTED RISK (CKV_AWS_252): Checkov wants an SNS topic wired to this
+# trail for real-time alerting. Skipped for this portfolio project to avoid
+# an always-on SNS resource with no subscriber. In production this would
+# route to the org's SIEM (e.g. Splunk/Datadog) via a log pipeline instead
+# of a bare SNS topic — noting the gap rather than adding an unused resource.
+#checkov:skip=CKV_AWS_252:No SNS subscriber in this environment; would route to SIEM in production
 resource "aws_cloudtrail" "pipeline" {
   name                          = "${var.project_name}-audit-trail-${var.environment}"
   s3_bucket_name                = aws_s3_bucket.access_logs.id
