@@ -72,6 +72,7 @@ Developer pushes code
 ├── terraform/
 │   ├── main.tf           # ECR, S3, KMS, CloudTrail
 │   ├── iam_policies.tf   # OIDC trust + least-privilege CI/CD role
+│   ├── backend-dev.hcl   # Partial S3 backend config (terraform init -backend-config)
 │   ├── variables.tf
 │   └── outputs.tf
 ├── policies/
@@ -83,7 +84,9 @@ Developer pushes code
 ├── .github/workflows/
 │   └── secure-pipeline.yml  # Full CI/CD pipeline definition
 ├── .pre-commit-config.yaml
-└── pyproject.toml        # Bandit configuration
+├── pyproject.toml        # Bandit configuration
+├── LOCALSTACK.md         # Testing the Terraform locally against LocalStack
+└── README.md
 ```
 
 ## Setup
