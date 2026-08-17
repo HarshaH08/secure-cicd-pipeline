@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    # Weekly drift check. New CVEs are disclosed against unchanged code, so a
+    # pipeline that only runs on push reports "secure" purely because nobody
+    # committed. This surfaces base-image and dependency drift on its own
+    # schedule instead of ambushing an unrelated commit.
+    - cron: "0 6 * * 1"  # Mondays 06:00 UTC
 
 # Minimal token permissions (least privilege for GITHUB_TOKEN)
 permissions:
@@ -117,27 +123,50 @@ jobs:
       - name: Install scanners
         run: pip install pip-audit safety
 
+      # No --ignore-vuln here: every exception lives in the ALLOWLIST below so
+      # that suppressions are reviewable in one place rather than split between
+      # a CLI flag and the gate logic.
       - name: Run pip-audit (checks PyPI advisory DB)
         run: |
           pip-audit -r app/requirements.txt \
             --format json \
             --output pip-audit-results.json \
-            --ignore-vuln PYSEC-2022-42969 \
             || true
 
       - name: Parse pip-audit results
         run: |
-          python3 -c "
+          python3 - <<'PY'
           import json, sys
-          with open('pip-audit-results.json') as f:
-            data = json.load(f)
-          vulns = data.get('dependencies', [])
-          critical = [v for dep in vulns for v in dep.get('vulns', []) if 'CRITICAL' in str(v.get('aliases', ''))]
-          if critical:
-            print(f'FAIL: {len(critical)} CRITICAL CVE(s) found!')
-            sys.exit(1)
-          print(f'PASS: pip-audit found no critical vulnerabilities.')
-          "
+
+          # Advisories consciously accepted, each with a reason. An entry here is
+          # a decision someone made, not a default. Keep it short and re-review it.
+          ALLOWLIST = {
+              # "PYSEC-0000-000": "why this is accepted, and when to revisit",
+          }
+
+          with open("pip-audit-results.json") as f:
+              data = json.load(f)
+
+          findings = [
+              (dep["name"], dep["version"], v)
+              for dep in data.get("dependencies", [])
+              for v in dep.get("vulns", [])
+          ]
+
+          for name, version, v in findings:
+              state = "ALLOWED" if v["id"] in ALLOWLIST else "BLOCKING"
+              fix = ", ".join(v.get("fix_versions") or ["no fix available"])
+              aliases = ", ".join(v.get("aliases") or [])
+              print(f"[{state}] {name}=={version}  {v['id']} ({aliases})  fix: {fix}")
+
+          blocking = [f for f in findings if f[2]["id"] not in ALLOWLIST]
+          if blocking:
+              print(f"\nFAIL: {len(blocking)} unreviewed advisory/advisories in app/requirements.txt.")
+              print("Upgrade the package, or add the advisory ID to ALLOWLIST with a reason.")
+              sys.exit(1)
+
+          print(f"\nPASS: {len(findings)} advisory/advisories found, all explicitly allowlisted.")
+          PY
 
       - name: Run Safety (checks against Safety DB)
         run: |
@@ -261,8 +290,10 @@ jobs:
           cache-to: type=gha,mode=max
           load: true  # load into local docker daemon for scanning
 
+      # Pinned to a release tag, not @master: an unpinned scanner is itself a
+      # supply-chain risk, and moving refs make builds non-reproducible.
       - name: Run Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           format: sarif
@@ -280,7 +311,7 @@ jobs:
           category: trivy
 
       - name: Run Trivy filesystem scan (Dockerfile + app code)
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: app/
